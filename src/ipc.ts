@@ -1,14 +1,21 @@
+import { CronExpressionParser } from 'cron-parser';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-
-import { CronExpressionParser } from 'cron-parser';
-
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
-import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import type { AvailableGroup } from './container-runner.js';
+import {
+  createTask,
+  deleteTask,
+  getTaskById,
+  getUserProfileByDiscordId,
+  setUserProfile,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import type { RegisteredGroup, UserProfile } from './types.js';
+import { lookupLinuxUser, validateUserSetup } from './user-profile.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -172,6 +179,19 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For healer_setup
+    action?: string;
+    linuxUsername?: string;
+    discordUserId?: string;
+    repoName?: string;
+    localPath?: string;
+    inspectionTypes?: string[];
+    schedule?: string;
+    sourceName?: string;
+    host?: string;
+    logPath?: string;
+    logPattern?: string;
+    linkedRepo?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -454,6 +474,206 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'healer_setup': {
+      // Type-safe access to healer-specific fields
+      const healerData = data as Record<string, unknown>;
+
+      if (healerData.action === 'create_profile') {
+        const linuxUsername = healerData.linuxUsername as string;
+        const discordUserId = healerData.discordUserId as string;
+        const chatJid = healerData.chatJid as string;
+        const groupFolder = healerData.groupFolder as string;
+
+        const user = lookupLinuxUser(linuxUsername);
+        if (!user) {
+          await deps.sendMessage(
+            chatJid,
+            `Linux user "${linuxUsername}" not found on this system.`,
+          );
+          break;
+        }
+
+        const status = validateUserSetup(user.homeDir);
+        if (status.errors.length > 0) {
+          await deps.sendMessage(
+            chatJid,
+            `Setup issues:\n${status.errors.map((e) => `- ${e}`).join('\n')}`,
+          );
+          break;
+        }
+
+        const existing = getUserProfileByDiscordId(discordUserId);
+        const profile: UserProfile = {
+          id: existing?.id || randomUUID(),
+          discordUserId,
+          linuxUsername: user.username,
+          uid: user.uid,
+          gid: user.gid,
+          homeDir: user.homeDir,
+          repos: existing?.repos || [],
+          remoteSources: existing?.remoteSources || [],
+          createdAt: existing?.createdAt || new Date().toISOString(),
+        };
+
+        setUserProfile(profile);
+
+        // Link the group's containerConfig to the profile
+        const groups = deps.registeredGroups();
+        for (const [jid, group] of Object.entries(groups)) {
+          if (group.folder === groupFolder) {
+            const updatedGroup = {
+              ...group,
+              containerConfig: {
+                ...group.containerConfig,
+                userProfileId: profile.id,
+              },
+            };
+            deps.registerGroup(jid, updatedGroup);
+            break;
+          }
+        }
+
+        await deps.sendMessage(
+          chatJid,
+          `Profile created for ${user.username} (uid: ${user.uid}).\n` +
+            `Claude auth: ✓\nGitHub CLI: ✓\n\n` +
+            `Next: tell me which repos to monitor and where to find logs.`,
+        );
+        logger.info(
+          {
+            discordUserId,
+            linuxUsername: user.username,
+            profileId: profile.id,
+          },
+          'Healer profile created',
+        );
+      }
+
+      if (healerData.action === 'add_repo') {
+        const discordUserId = healerData.discordUserId as string;
+        const chatJid = healerData.chatJid as string;
+        const groupFolder = healerData.groupFolder as string;
+        const repoName = healerData.repoName as string;
+        const localPath = healerData.localPath as string;
+        const inspectionTypes = healerData.inspectionTypes as string[];
+        const schedule = (healerData.schedule as string) || '0 23 * * *';
+
+        const profile = getUserProfileByDiscordId(discordUserId);
+        if (!profile) {
+          await deps.sendMessage(
+            chatJid,
+            'No healer profile found. Run setup first.',
+          );
+          break;
+        }
+
+        // Check for duplicate
+        if (profile.repos.find((r) => r.name === repoName)) {
+          await deps.sendMessage(
+            chatJid,
+            `Repo "${repoName}" already configured. Remove it first to reconfigure.`,
+          );
+          break;
+        }
+
+        profile.repos.push({
+          name: repoName,
+          localPath,
+          inspectionTypes: inspectionTypes as Array<
+            'log-analysis' | 'code-review' | 'security-review'
+          >,
+          schedule,
+          healBranchPrefix: 'heal/',
+        });
+
+        setUserProfile(profile);
+
+        // Create the scheduled heal task
+        let nextRun: string | null;
+        try {
+          const interval = CronExpressionParser.parse(schedule, {
+            tz: TIMEZONE,
+          });
+          nextRun = interval.next().toISOString();
+        } catch {
+          await deps.sendMessage(
+            chatJid,
+            `Invalid cron expression: ${schedule}`,
+          );
+          break;
+        }
+
+        const taskId = randomUUID();
+        createTask({
+          id: taskId,
+          group_folder: groupFolder,
+          chat_jid: chatJid,
+          prompt: `[HEAL:${profile.id}]`,
+          schedule_type: 'cron',
+          schedule_value: schedule,
+          context_mode: 'isolated',
+          next_run: nextRun,
+          status: 'active',
+          created_at: new Date().toISOString(),
+        });
+
+        deps.onTasksChanged();
+
+        await deps.sendMessage(
+          chatJid,
+          `Repo "${repoName}" added with ${inspectionTypes.join(', ')} inspection.\n` +
+            `Schedule: ${schedule}\n` +
+            `Heal task created (ID: ${taskId.slice(0, 8)}).`,
+        );
+        logger.info(
+          { discordUserId, repoName, taskId, schedule },
+          'Healer repo added with scheduled task',
+        );
+      }
+
+      if (healerData.action === 'add_log_source') {
+        const discordUserId = healerData.discordUserId as string;
+        const chatJid = healerData.chatJid as string;
+        const sourceName = healerData.sourceName as string;
+        const host = healerData.host as string;
+        const logPath = healerData.logPath as string;
+        const logPattern = (healerData.logPattern as string) || '*.log';
+        const linkedRepo = healerData.linkedRepo as string;
+
+        const profile = getUserProfileByDiscordId(discordUserId);
+        if (!profile) {
+          await deps.sendMessage(
+            chatJid,
+            'No healer profile found. Run setup first.',
+          );
+          break;
+        }
+
+        profile.remoteSources.push({
+          name: sourceName,
+          host,
+          logPath,
+          logPattern,
+          linkedRepo,
+        });
+
+        setUserProfile(profile);
+
+        await deps.sendMessage(
+          chatJid,
+          `Log source "${sourceName}" added.\n` +
+            `Host: ${host}\nPath: ${logPath}\nPattern: ${logPattern}\n` +
+            `Linked to repo: ${linkedRepo}`,
+        );
+        logger.info(
+          { discordUserId, sourceName, host, linkedRepo },
+          'Healer log source added',
+        );
+      }
+
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

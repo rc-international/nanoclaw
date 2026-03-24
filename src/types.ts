@@ -30,6 +30,7 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  userProfileId?: string; // Links group to a user profile for per-user isolation
 }
 
 export interface RegisteredGroup {
@@ -105,3 +106,35 @@ export type OnChatMetadata = (
   channel?: string,
   isGroup?: boolean,
 ) => void;
+
+// --- Code Healer types ---
+
+export type InspectionType = 'log-analysis' | 'code-review' | 'security-review';
+
+export interface RepoConfig {
+  name: string;
+  localPath: string;
+  inspectionTypes: InspectionType[];
+  schedule: string; // cron expression, default "0 23 * * *"
+  healBranchPrefix: string; // default "heal/"
+}
+
+export interface RemoteLogSource {
+  name: string;
+  host: string; // Tailscale hostname or IP
+  logPath: string; // Remote path, e.g., "/var/log/api/"
+  logPattern: string; // Glob, e.g., "*.log"
+  linkedRepo: string; // RepoConfig.name
+}
+
+export interface UserProfile {
+  id: string;
+  discordUserId: string;
+  linuxUsername: string;
+  uid: number;
+  gid: number;
+  homeDir: string;
+  repos: RepoConfig[];
+  remoteSources: RemoteLogSource[];
+  createdAt: string;
+}

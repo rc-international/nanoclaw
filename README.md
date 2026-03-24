@@ -72,6 +72,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 - **Web access** - Search and fetch content from the Web
 - **Container isolation** - Agents are sandboxed in Docker (macOS/Linux), [Docker Sandboxes](docs/docker-sandboxes.md) (micro VM isolation), or Apple Container (macOS)
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks
+- **[Code Healer](docs/CODE-HEALER.md)** - Automated nightly log analysis and code repair with branch + PR workflow. Multi-user support with per-user credential isolation
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 
 ## Usage

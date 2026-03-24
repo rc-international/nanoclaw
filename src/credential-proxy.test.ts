@@ -1,17 +1,37 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import http from 'http';
 import type { AddressInfo } from 'net';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockEnv: Record<string, string> = {};
 vi.mock('./env.js', () => ({
   readEnvFile: vi.fn(() => ({ ...mockEnv })),
 }));
 
+// Prevent tests from reading the real ~/.claude/.credentials.json
+vi.mock('fs', async () => {
+  const actual = await vi.importActual<typeof import('fs')>('fs');
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      readFileSync: vi.fn((filePath: string, ...args: unknown[]) => {
+        if (String(filePath).includes('.credentials.json')) {
+          throw new Error('mocked: file not found');
+        }
+        return actual.readFileSync(filePath, ...(args as [BufferEncoding]));
+      }),
+    },
+  };
+});
+
 vi.mock('./logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
 }));
 
-import { startCredentialProxy } from './credential-proxy.js';
+import {
+  startCredentialProxy,
+  startUserCredentialProxy,
+} from './credential-proxy.js';
 
 function makeRequest(
   port: number,
@@ -188,5 +208,73 @@ describe('credential-proxy', () => {
 
     expect(res.statusCode).toBe(502);
     expect(res.body).toBe('Bad Gateway');
+  });
+
+  describe('per-user credential proxy', () => {
+    let userProxyServer: http.Server;
+    let userUpstreamServer: http.Server;
+
+    afterEach(async () => {
+      await new Promise<void>((r) => userProxyServer?.close(() => r()));
+      await new Promise<void>((r) => userUpstreamServer?.close(() => r()));
+    });
+
+    it('reads OAuth token from the specified home directory', async () => {
+      // Override the fs mock to return a token for a specific path
+      const fsModule = await import('fs');
+      const spy = vi
+        .spyOn(fsModule.default, 'readFileSync')
+        .mockImplementation((filePath: any, ...args: any[]) => {
+          if (String(filePath) === '/home/testuser/.claude/.credentials.json') {
+            return JSON.stringify({
+              claudeAiOauth: { accessToken: 'user-specific-token' },
+            });
+          }
+          if (String(filePath).includes('.credentials.json')) {
+            throw new Error('mocked: file not found');
+          }
+          // For non-credentials files, we need the real readFileSync
+          // The test infrastructure needs real fs for module loading
+          throw new Error('unexpected read');
+        });
+
+      let capturedHeaders: http.IncomingHttpHeaders = {};
+      userUpstreamServer = http.createServer((req, res) => {
+        capturedHeaders = { ...req.headers };
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      await new Promise<void>((r) =>
+        userUpstreamServer.listen(0, '127.0.0.1', r),
+      );
+      const userUpstreamPort = (userUpstreamServer.address() as AddressInfo)
+        .port;
+
+      userProxyServer = await startUserCredentialProxy(
+        '/home/testuser',
+        0,
+        `http://127.0.0.1:${userUpstreamPort}`,
+      );
+      const userProxyPort = (userProxyServer.address() as AddressInfo).port;
+
+      await makeRequest(
+        userProxyPort,
+        {
+          method: 'POST',
+          path: '/api/oauth/claude_cli/create_api_key',
+          headers: {
+            'content-type': 'application/json',
+            authorization: 'Bearer placeholder',
+          },
+        },
+        '{}',
+      );
+
+      expect(capturedHeaders['authorization']).toBe(
+        'Bearer user-specific-token',
+      );
+
+      spy.mockRestore();
+    });
   });
 });

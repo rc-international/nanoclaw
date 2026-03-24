@@ -5,11 +5,12 @@ import path from 'path';
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import {
+import type {
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
   TaskRunLog,
+  UserProfile,
 } from './types.js';
 
 let db: Database.Database;
@@ -82,6 +83,20 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS user_profiles (
+      id TEXT PRIMARY KEY,
+      discord_user_id TEXT UNIQUE NOT NULL,
+      linux_username TEXT NOT NULL,
+      uid INTEGER NOT NULL,
+      gid INTEGER NOT NULL,
+      home_dir TEXT NOT NULL,
+      repos TEXT NOT NULL DEFAULT '[]',
+      remote_sources TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profiles_discord
+      ON user_profiles(discord_user_id);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -632,6 +647,78 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- User profile accessors ---
+
+interface UserProfileRow {
+  id: string;
+  discord_user_id: string;
+  linux_username: string;
+  uid: number;
+  gid: number;
+  home_dir: string;
+  repos: string;
+  remote_sources: string;
+  created_at: string;
+}
+
+function rowToUserProfile(row: UserProfileRow): UserProfile {
+  return {
+    id: row.id,
+    discordUserId: row.discord_user_id,
+    linuxUsername: row.linux_username,
+    uid: row.uid,
+    gid: row.gid,
+    homeDir: row.home_dir,
+    repos: JSON.parse(row.repos),
+    remoteSources: JSON.parse(row.remote_sources),
+    createdAt: row.created_at,
+  };
+}
+
+export function getUserProfile(id: string): UserProfile | undefined {
+  const row = db.prepare('SELECT * FROM user_profiles WHERE id = ?').get(id) as
+    | UserProfileRow
+    | undefined;
+  return row ? rowToUserProfile(row) : undefined;
+}
+
+export function getUserProfileByDiscordId(
+  discordUserId: string,
+): UserProfile | undefined {
+  const row = db
+    .prepare('SELECT * FROM user_profiles WHERE discord_user_id = ?')
+    .get(discordUserId) as UserProfileRow | undefined;
+  return row ? rowToUserProfile(row) : undefined;
+}
+
+export function setUserProfile(profile: UserProfile): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO user_profiles (id, discord_user_id, linux_username, uid, gid, home_dir, repos, remote_sources, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    profile.id,
+    profile.discordUserId,
+    profile.linuxUsername,
+    profile.uid,
+    profile.gid,
+    profile.homeDir,
+    JSON.stringify(profile.repos),
+    JSON.stringify(profile.remoteSources),
+    profile.createdAt,
+  );
+}
+
+export function deleteUserProfile(id: string): void {
+  db.prepare('DELETE FROM user_profiles WHERE id = ?').run(id);
+}
+
+export function getAllUserProfiles(): UserProfile[] {
+  const rows = db
+    .prepare('SELECT * FROM user_profiles')
+    .all() as UserProfileRow[];
+  return rows.map(rowToUserProfile);
 }
 
 // --- JSON migration ---

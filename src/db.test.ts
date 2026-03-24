@@ -1,19 +1,25 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
   _initTestDatabase,
   createTask,
   deleteTask,
+  deleteUserProfile,
   getAllChats,
   getAllRegisteredGroups,
+  getAllUserProfiles,
   getMessagesSince,
   getNewMessages,
   getTaskById,
+  getUserProfile,
+  getUserProfileByDiscordId,
   setRegisteredGroup,
+  setUserProfile,
   storeChatMetadata,
   storeMessage,
   updateTask,
 } from './db.js';
+import type { UserProfile } from './types.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -480,5 +486,81 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- User Profiles ---
+
+const testProfile: UserProfile = {
+  id: 'prof-1',
+  discordUserId: '123456789',
+  linuxUsername: 'alice',
+  uid: 1001,
+  gid: 1001,
+  homeDir: '/home/alice',
+  repos: [
+    {
+      name: 'api',
+      localPath: '/home/alice/projects/api',
+      inspectionTypes: ['log-analysis'],
+      schedule: '0 23 * * *',
+      healBranchPrefix: 'heal/',
+    },
+  ],
+  remoteSources: [
+    {
+      name: 'prod-api',
+      host: '100.84.112.81',
+      logPath: '/var/log/api/',
+      logPattern: '*.log',
+      linkedRepo: 'api',
+    },
+  ],
+  createdAt: '2026-03-24T00:00:00.000Z',
+};
+
+describe('user profiles', () => {
+  it('stores and retrieves a profile by id', () => {
+    setUserProfile(testProfile);
+    const result = getUserProfile('prof-1');
+    expect(result).toEqual(testProfile);
+  });
+
+  it('retrieves a profile by Discord user ID', () => {
+    setUserProfile(testProfile);
+    const result = getUserProfileByDiscordId('123456789');
+    expect(result).toEqual(testProfile);
+  });
+
+  it('returns undefined for missing profile', () => {
+    expect(getUserProfile('nonexistent')).toBeUndefined();
+    expect(getUserProfileByDiscordId('000')).toBeUndefined();
+  });
+
+  it('updates an existing profile', () => {
+    setUserProfile(testProfile);
+    const updated = { ...testProfile, repos: [] };
+    setUserProfile(updated);
+    const result = getUserProfile('prof-1');
+    expect(result?.repos).toEqual([]);
+  });
+
+  it('deletes a profile', () => {
+    setUserProfile(testProfile);
+    deleteUserProfile('prof-1');
+    expect(getUserProfile('prof-1')).toBeUndefined();
+  });
+
+  it('lists all profiles', () => {
+    setUserProfile(testProfile);
+    const bob = {
+      ...testProfile,
+      id: 'prof-2',
+      discordUserId: '987',
+      linuxUsername: 'bob',
+    };
+    setUserProfile(bob);
+    const all = getAllUserProfiles();
+    expect(all).toHaveLength(2);
   });
 });

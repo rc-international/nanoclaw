@@ -1,10 +1,10 @@
-import { ChildProcess } from 'child_process';
+import type { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
-  ContainerOutput,
+  type ContainerOutput,
   runContainerAgent,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -12,14 +12,17 @@ import {
   getAllTasks,
   getDueTasks,
   getTaskById,
+  getUserProfile,
   logTaskRun,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import type { GroupQueue } from './group-queue.js';
+import { buildHealPrompt } from './heal-prompt.js';
+import { cleanupSyncedLogs, syncAllRemoteLogs } from './log-sync.js';
 import { logger } from './logger.js';
-import { RegisteredGroup, ScheduledTask } from './types.js';
+import type { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
  * Compute the next run time for a recurring task, anchored to the
@@ -109,9 +112,7 @@ async function runTask(
   );
 
   const groups = deps.registeredGroups();
-  const group = Object.values(groups).find(
-    (g) => g.folder === task.group_folder,
-  );
+  let group = Object.values(groups).find((g) => g.folder === task.group_folder);
 
   if (!group) {
     logger.error(
@@ -127,6 +128,74 @@ async function runTask(
       error: `Group not found: ${task.group_folder}`,
     });
     return;
+  }
+
+  // Detect heal tasks and run pre-task log sync
+  const healMatch = task.prompt.match(/^\[HEAL:([^\]]+)\]$/);
+  let healLogMounts: Record<string, string> = {};
+  let healProfileId: string | null = null;
+
+  if (healMatch) {
+    healProfileId = healMatch[1];
+    const profile = getUserProfile(healProfileId);
+
+    if (!profile) {
+      logger.error(
+        { taskId: task.id, profileId: healProfileId },
+        'User profile not found for heal task',
+      );
+      logTaskRun({
+        task_id: task.id,
+        run_at: new Date().toISOString(),
+        duration_ms: Date.now() - startTime,
+        status: 'error',
+        result: null,
+        error: `User profile not found: ${healProfileId}`,
+      });
+      return;
+    }
+
+    // Sync remote logs before spawning container
+    healLogMounts = syncAllRemoteLogs(profile);
+
+    // Build prompts for each repo × inspection type combo
+    const prompts: string[] = [];
+    for (const repo of profile.repos) {
+      // Filter synced logs to those linked to this repo
+      const repoLogs: Record<string, string> = {};
+      for (const source of profile.remoteSources) {
+        if (source.linkedRepo === repo.name && healLogMounts[source.name]) {
+          repoLogs[source.name] = `/workspace/extra/${source.name}`;
+        }
+      }
+
+      for (const inspectionType of repo.inspectionTypes) {
+        prompts.push(buildHealPrompt(repo, inspectionType, repoLogs));
+      }
+    }
+
+    // Replace the [HEAL:id] prompt with the generated prompts
+    task = { ...task, prompt: prompts.join('\n\n---\n\n') };
+
+    // Add synced log dirs as temporary additional mounts on the group
+    if (Object.keys(healLogMounts).length > 0) {
+      const logMounts = Object.entries(healLogMounts).map(([name, dir]) => ({
+        hostPath: dir,
+        containerPath: name,
+        readonly: true as const,
+      }));
+
+      group = {
+        ...group,
+        containerConfig: {
+          ...group.containerConfig,
+          additionalMounts: [
+            ...(group.containerConfig?.additionalMounts || []),
+            ...logMounts,
+          ],
+        },
+      };
+    }
   }
 
   // Update tasks snapshot for container to read (filtered by group)
@@ -228,6 +297,11 @@ async function runTask(
     result,
     error,
   });
+
+  // Clean up synced logs after heal task
+  if (healProfileId) {
+    cleanupSyncedLogs(healProfileId);
+  }
 
   const nextRun = computeNextRun(task);
   const resultSummary = error
