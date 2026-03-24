@@ -2,10 +2,11 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { type ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import type { Server } from 'http';
+import type { AddressInfo } from 'net';
 import path from 'path';
-
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
@@ -16,8 +17,6 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
-import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
-import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
@@ -25,9 +24,15 @@ import {
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { detectAuthMode } from './credential-proxy.js';
-import { validateAdditionalMounts } from './mount-security.js';
-import { RegisteredGroup } from './types.js';
+import {
+  detectAuthMode,
+  startUserCredentialProxy,
+} from './credential-proxy.js';
+import { getUserProfile } from './db.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import { logger } from './logger.js';
+import { validateAdditionalMounts, validateMount } from './mount-security.js';
+import type { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -209,12 +214,59 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
+  // User profile mounts: repos and gh CLI config
+  if (group.containerConfig?.userProfileId) {
+    const profile = getUserProfile(group.containerConfig.userProfileId);
+    if (profile) {
+      // Mount each configured repo
+      for (const repo of profile.repos) {
+        const repoValidation = validateMount(
+          {
+            hostPath: repo.localPath,
+            containerPath: repo.name,
+            readonly: false,
+          },
+          isMain,
+        );
+        if (repoValidation.allowed) {
+          mounts.push({
+            hostPath: repoValidation.realHostPath!,
+            containerPath: `/workspace/extra/${repoValidation.resolvedContainerPath}`,
+            readonly: repoValidation.effectiveReadonly!,
+          });
+        } else {
+          logger.warn(
+            {
+              repo: repo.name,
+              path: repo.localPath,
+              reason: repoValidation.reason,
+            },
+            'Repo mount rejected by allowlist',
+          );
+        }
+      }
+
+      // Mount gh CLI config (read-only)
+      const ghConfigDir = path.join(profile.homeDir, '.config', 'gh');
+      if (fs.existsSync(ghConfigDir)) {
+        mounts.push({
+          hostPath: ghConfigDir,
+          containerPath: '/workspace/extra/.gh-config',
+          readonly: true,
+        });
+      }
+    }
+  }
+
   return mounts;
 }
 
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  userUid?: number,
+  userGid?: number,
+  proxyPortOverride?: number,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -222,9 +274,10 @@ function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Route API traffic through the credential proxy (containers never see real secrets)
+  const proxyPort = proxyPortOverride ?? CREDENTIAL_PROXY_PORT;
   args.push(
     '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${proxyPort}`,
   );
 
   // Mirror the host's auth method with a placeholder value.
@@ -244,10 +297,10 @@ function buildContainerArgs(
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
   // or when getuid is unavailable (native Windows without WSL).
-  const hostUid = process.getuid?.();
-  const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
+  const effectiveUid = userUid ?? process.getuid?.();
+  const effectiveGid = userGid ?? process.getgid?.();
+  if (effectiveUid != null && effectiveUid !== 0 && effectiveUid !== 1000) {
+    args.push('--user', `${effectiveUid}:${effectiveGid}`);
     args.push('-e', 'HOME=/home/node');
   }
 
@@ -275,10 +328,46 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
+  let userProxy: Server | null = null;
+  let userProxyPort: number | null = null;
+  let profileUid: number | undefined;
+  let profileGid: number | undefined;
+
+  if (group.containerConfig?.userProfileId) {
+    const profile = getUserProfile(group.containerConfig.userProfileId);
+    if (profile) {
+      profileUid = profile.uid;
+      profileGid = profile.gid;
+      try {
+        userProxy = await startUserCredentialProxy(profile.homeDir);
+        userProxyPort = (userProxy.address() as AddressInfo).port;
+        logger.info(
+          {
+            group: group.name,
+            user: profile.linuxUsername,
+            port: userProxyPort,
+          },
+          'Per-user credential proxy started',
+        );
+      } catch (err) {
+        logger.error(
+          { group: group.name, user: profile.linuxUsername, err },
+          'Failed to start per-user credential proxy',
+        );
+      }
+    }
+  }
+
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(
+    mounts,
+    containerName,
+    profileUid,
+    profileGid,
+    userProxyPort ?? undefined,
+  );
 
   logger.debug(
     {
@@ -433,6 +522,15 @@ export async function runContainerAgent(
     };
 
     container.on('close', (code) => {
+      // Clean up per-user proxy
+      if (userProxy) {
+        userProxy.close(() => {
+          logger.debug(
+            { group: group.name },
+            'Per-user credential proxy closed',
+          );
+        });
+      }
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
