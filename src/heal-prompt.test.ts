@@ -12,7 +12,9 @@ const repo: RepoConfig = {
 
 describe('buildHealPrompt', () => {
   it('builds log-analysis prompt with repo and logs', () => {
-    const prompt = buildHealPrompt(repo, 'log-analysis', { 'prod-api': '/workspace/logs/prod-api' });
+    const prompt = buildHealPrompt(repo, 'log-analysis', {
+      'prod-api': '/workspace/logs/prod-api',
+    });
     expect(prompt).toContain('/workspace/extra/api');
     expect(prompt).toContain('/workspace/logs/prod-api');
     expect(prompt).toContain('heal/');

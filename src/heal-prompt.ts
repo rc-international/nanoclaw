@@ -4,7 +4,9 @@ function getTodayDate(): string {
   return new Date().toISOString().split('T')[0];
 }
 
-function buildLogAnalysisInstructions(syncedLogDirs: Record<string, string>): string {
+function buildLogAnalysisInstructions(
+  syncedLogDirs: Record<string, string>,
+): string {
   const logEntries = Object.entries(syncedLogDirs);
 
   if (logEntries.length === 0) {
