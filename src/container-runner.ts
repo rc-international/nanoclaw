@@ -4,30 +4,23 @@
  */
 import { type ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
-import type { Server } from 'http';
-import type { AddressInfo } from 'net';
+import os from 'os';
 import path from 'path';
 import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
-  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
 import {
-  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import {
-  detectAuthMode,
-  startUserCredentialProxy,
-} from './credential-proxy.js';
 import { getUserProfile } from './db.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -168,6 +161,32 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount the user's Claude credentials file (read-only) into the per-group
+  // .claude directory. The `claude` CLI authenticates directly via this file
+  // using the user's Claude Max subscription — no proxy or token exchange needed.
+  const userProfileId = group.containerConfig?.userProfileId;
+  if (userProfileId) {
+    const profile = getUserProfile(userProfileId);
+    if (!profile) {
+      throw new Error(`Unknown user profile: ${userProfileId}`);
+    }
+    const credsSource = path.join(
+      profile.homeDir,
+      '.claude',
+      '.credentials.json',
+    );
+    if (!fs.existsSync(credsSource)) {
+      throw new Error(
+        `Claude credentials not found for profile ${userProfileId} at ${credsSource}`,
+      );
+    }
+    mounts.push({
+      hostPath: credsSource,
+      containerPath: '/home/node/.claude/.credentials.json',
+      readonly: true,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
@@ -195,7 +214,7 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+  if (fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
@@ -266,30 +285,11 @@ function buildContainerArgs(
   containerName: string,
   userUid?: number,
   userGid?: number,
-  proxyPortOverride?: number,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
-
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  const proxyPort = proxyPortOverride ?? CREDENTIAL_PROXY_PORT;
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${proxyPort}`,
-  );
-
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
-  } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
-  }
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
@@ -328,8 +328,6 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  let userProxy: Server | null = null;
-  let userProxyPort: number | null = null;
   let profileUid: number | undefined;
   let profileGid: number | undefined;
 
@@ -338,23 +336,6 @@ export async function runContainerAgent(
     if (profile) {
       profileUid = profile.uid;
       profileGid = profile.gid;
-      try {
-        userProxy = await startUserCredentialProxy(profile.homeDir);
-        userProxyPort = (userProxy.address() as AddressInfo).port;
-        logger.info(
-          {
-            group: group.name,
-            user: profile.linuxUsername,
-            port: userProxyPort,
-          },
-          'Per-user credential proxy started',
-        );
-      } catch (err) {
-        logger.error(
-          { group: group.name, user: profile.linuxUsername, err },
-          'Failed to start per-user credential proxy',
-        );
-      }
     }
   }
 
@@ -366,7 +347,6 @@ export async function runContainerAgent(
     containerName,
     profileUid,
     profileGid,
-    userProxyPort ?? undefined,
   );
 
   logger.debug(
@@ -522,15 +502,6 @@ export async function runContainerAgent(
     };
 
     container.on('close', (code) => {
-      // Clean up per-user proxy
-      if (userProxy) {
-        userProxy.close(() => {
-          logger.debug(
-            { group: group.name },
-            'Per-user credential proxy closed',
-          );
-        });
-      }
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
 
