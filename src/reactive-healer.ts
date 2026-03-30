@@ -1,6 +1,21 @@
+import type { ChildProcess } from "node:child_process";
+import { runContainerAgent } from "./container-runner.js";
+import { getUserProfileByLinuxUsername } from "./db.js";
+import type { GroupQueue } from "./group-queue.js";
 import { logger } from "./logger.js";
+import { buildReactiveHealPrompt } from "./reactive-heal-prompt.js";
+import {
+	blameLineForSessionId,
+	cleanupClone,
+	cloneRepo,
+} from "./repo-cloner.js";
 import { parseTraceback } from "./traceback-parser.js";
-import type { HealBatch, HealBatchEntry, HealRequest } from "./types.js";
+import type {
+	HealBatch,
+	HealBatchEntry,
+	HealRequest,
+	RegisteredGroup,
+} from "./types.js";
 
 type ValidationResult =
 	| { ok: true; request: HealRequest }
@@ -154,5 +169,226 @@ export class HealDebouncer {
 			clearTimeout(batch.timer);
 		}
 		this.batches.clear();
+	}
+}
+
+/**
+ * Extract a heal JSON payload from a Discord message.
+ * Checks for JSON code blocks (```json ... ```) and plain JSON objects
+ * containing `"nanoclaw": "heal"`.
+ */
+export function extractHealPayload(
+	content: string,
+): Record<string, unknown> | null {
+	// Try code block first
+	const codeBlockMatch = content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+	if (codeBlockMatch) {
+		try {
+			const parsed = JSON.parse(codeBlockMatch[1]);
+			if (parsed?.nanoclaw === "heal") return parsed;
+		} catch (e) {
+			logger.debug({ error: e }, "Non-JSON content in code block");
+		}
+	}
+
+	// Try plain JSON (find first { ... } containing "nanoclaw")
+	const jsonMatch = content.match(/\{[^{}]*"nanoclaw"\s*:\s*"heal"[^{}]*\}/);
+	if (jsonMatch) {
+		try {
+			return JSON.parse(jsonMatch[0]);
+		} catch (e) {
+			logger.debug({ error: e }, "Malformed JSON in message");
+		}
+	}
+
+	return null;
+}
+
+export interface ReactiveHealerDeps {
+	queue: GroupQueue;
+	sendMessage: (jid: string, text: string) => Promise<void>;
+	onProcess: (
+		groupJid: string,
+		proc: ChildProcess,
+		containerName: string,
+		groupFolder: string,
+	) => void;
+}
+
+/**
+ * Create the reactive healer instance. Returns:
+ * - `handleMessage(content, channelJid)` — call from Discord handler
+ * - `destroy()` — cleanup timers on shutdown
+ */
+export function createReactiveHealer(deps: ReactiveHealerDeps) {
+	const debouncer = new HealDebouncer((batch) => {
+		const taskId = `reactive-heal-${batch.user}-${batch.repo}-${Date.now()}`;
+		deps.queue.enqueueTask(batch.sourceChannelJid, taskId, () =>
+			executeReactiveHeal(batch, deps),
+		);
+	});
+
+	return {
+		handleMessage(content: string, channelJid: string): boolean {
+			const raw = extractHealPayload(content);
+			if (!raw) return false;
+
+			const validation = validateHealPayload(raw);
+			if (!validation.ok) {
+				logger.warn(
+					{ error: validation.error },
+					"Invalid heal payload received",
+				);
+				deps
+					.sendMessage(channelJid, `Invalid heal request: ${validation.error}`)
+					.catch((e) =>
+						logger.debug({ error: e }, "Failed to send validation error"),
+					);
+				return true; // consumed the message (even though invalid)
+			}
+
+			debouncer.add(validation.request, channelJid);
+			return true; // consumed
+		},
+
+		destroy() {
+			debouncer.destroy();
+		},
+	};
+}
+
+async function executeReactiveHeal(
+	batch: HealBatch,
+	deps: ReactiveHealerDeps,
+): Promise<void> {
+	const startTime = Date.now();
+
+	// 1. Resolve user profile
+	const profile = getUserProfileByLinuxUsername(batch.user);
+	if (!profile) {
+		logger.error({ user: batch.user }, "Unknown user for reactive heal");
+		await deps.sendMessage(
+			batch.sourceChannelJid,
+			`Unknown user \`${batch.user}\` — register with the bot first.`,
+		);
+		return;
+	}
+
+	// 2. Clone the repo
+	let cloneDir: string;
+	try {
+		cloneDir = await cloneRepo(
+			batch.repo_url,
+			batch.user,
+			batch.repo,
+			batch.entries[0]?.commit,
+		);
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		logger.error({ error: msg, repo: batch.repo_url }, "Failed to clone repo");
+		await deps.sendMessage(
+			batch.sourceChannelJid,
+			`Failed to clone \`${batch.repo}\`: ${msg}`,
+		);
+		return;
+	}
+
+	try {
+		// 3. Trace errors — run git blame for each entry
+		let primarySessionId: string | undefined;
+		for (const entry of batch.entries) {
+			if (entry.file && entry.file !== "unknown" && entry.line > 0) {
+				const blame = blameLineForSessionId(cloneDir, entry.file, entry.line);
+				if (blame) {
+					entry.blameCommit = blame.commitSha;
+					if (blame.sessionId) {
+						entry.sessionId = blame.sessionId;
+						if (!primarySessionId) {
+							primarySessionId = blame.sessionId;
+						}
+					}
+				}
+			}
+		}
+
+		// 4. Build prompt
+		const prompt = buildReactiveHealPrompt(
+			batch,
+			`/workspace/extra/${batch.repo}`,
+		);
+
+		// 5. Build a temporary RegisteredGroup for the container
+		const group: RegisteredGroup = {
+			name: `reactive-heal-${batch.user}-${batch.repo}`,
+			folder: `reactive-heal-${batch.user}`,
+			trigger: /.*/,
+			added_at: new Date().toISOString(),
+			containerConfig: {
+				userProfileId: profile.id,
+				additionalMounts: [
+					{
+						hostPath: cloneDir,
+						containerPath: batch.repo,
+						readonly: false,
+					},
+				],
+			},
+		};
+
+		// 6. Spawn container
+		logger.info(
+			{
+				user: batch.user,
+				repo: batch.repo,
+				entries: batch.entries.length,
+				sessionId: primarySessionId || "new",
+			},
+			"Spawning reactive heal container",
+		);
+
+		const output = await runContainerAgent(
+			group,
+			{
+				prompt,
+				sessionId: primarySessionId,
+				groupFolder: group.folder,
+				chatJid: batch.sourceChannelJid,
+				isMain: false,
+				isScheduledTask: true,
+				assistantName: "NanoClaw Healer",
+			},
+			(proc, containerName) =>
+				deps.onProcess(
+					batch.sourceChannelJid,
+					proc,
+					containerName,
+					group.folder,
+				),
+			async (streamedOutput) => {
+				if (streamedOutput.result) {
+					await deps.sendMessage(batch.sourceChannelJid, streamedOutput.result);
+				}
+			},
+		);
+
+		if (output.status === "error") {
+			logger.error(
+				{ error: output.error, repo: batch.repo },
+				"Reactive heal container failed",
+			);
+		}
+
+		logger.info(
+			{
+				user: batch.user,
+				repo: batch.repo,
+				durationMs: Date.now() - startTime,
+				status: output.status,
+			},
+			"Reactive heal completed",
+		);
+	} finally {
+		// 7. Cleanup
+		cleanupClone(cloneDir);
 	}
 }

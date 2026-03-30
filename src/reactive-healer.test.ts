@@ -4,7 +4,12 @@ vi.mock("./logger.js", () => ({
 	logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
 }));
 
-import { HealDebouncer, validateHealPayload } from "./reactive-healer.js";
+import {
+	createReactiveHealer,
+	extractHealPayload,
+	HealDebouncer,
+	validateHealPayload,
+} from "./reactive-healer.js";
 import type { HealBatch, HealRequest } from "./types.js";
 
 describe("validateHealPayload", () => {
@@ -198,5 +203,101 @@ describe("HealDebouncer", () => {
 		expect(batch.entries[0].line).toBe(42);
 
 		debouncer.destroy();
+	});
+});
+
+describe("extractHealPayload", () => {
+	it("extracts JSON from a code block", () => {
+		const content =
+			'some text\n```json\n{"nanoclaw":"heal","user":"bjern","repo":"dr","repo_url":"https://x","error":"e"}\n```\nmore text';
+		const result = extractHealPayload(content);
+		expect(result).not.toBeNull();
+		expect(result!.nanoclaw).toBe("heal");
+	});
+
+	it("extracts JSON from plain text", () => {
+		const content =
+			'{"nanoclaw":"heal","user":"bjern","repo":"dr","repo_url":"https://x","error":"e"}';
+		const result = extractHealPayload(content);
+		expect(result).not.toBeNull();
+	});
+
+	it("returns null for non-heal JSON", () => {
+		const content = '```json\n{"type":"other"}\n```';
+		expect(extractHealPayload(content)).toBeNull();
+	});
+
+	it("returns null for no JSON", () => {
+		expect(extractHealPayload("just a message")).toBeNull();
+	});
+});
+
+describe("createReactiveHealer", () => {
+	beforeEach(() => {
+		vi.useFakeTimers();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("processes a valid heal message and fires debounced batch", () => {
+		const sendMessage = vi.fn().mockResolvedValue(undefined);
+		const enqueueTask = vi.fn();
+		const queue = { enqueueTask } as any;
+
+		const healer = createReactiveHealer({
+			queue,
+			sendMessage,
+			onProcess: vi.fn(),
+		});
+
+		const content =
+			'```json\n{"nanoclaw":"heal","user":"bjern","repo":"datarake","repo_url":"https://github.com/bjern/datarake","error":"400 Bad Request","file":"app.py","line":10}\n```';
+
+		const consumed = healer.handleMessage(content, "dc:123");
+		expect(consumed).toBe(true);
+		expect(enqueueTask).not.toHaveBeenCalled();
+
+		vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+
+		expect(enqueueTask).toHaveBeenCalledTimes(1);
+		expect(enqueueTask.mock.calls[0][0]).toBe("dc:123");
+
+		healer.destroy();
+	});
+
+	it("rejects invalid payload and sends error to channel", () => {
+		const sendMessage = vi.fn().mockResolvedValue(undefined);
+		const queue = { enqueueTask: vi.fn() } as any;
+
+		const healer = createReactiveHealer({
+			queue,
+			sendMessage,
+			onProcess: vi.fn(),
+		});
+
+		const content = '```json\n{"nanoclaw":"heal","user":"bjern"}\n```';
+		const consumed = healer.handleMessage(content, "dc:123");
+		expect(consumed).toBe(true);
+		expect(sendMessage).toHaveBeenCalledWith(
+			"dc:123",
+			expect.stringContaining("Invalid heal request"),
+		);
+
+		healer.destroy();
+	});
+
+	it("ignores non-heal messages", () => {
+		const healer = createReactiveHealer({
+			queue: { enqueueTask: vi.fn() } as any,
+			sendMessage: vi.fn().mockResolvedValue(undefined),
+			onProcess: vi.fn(),
+		});
+
+		expect(healer.handleMessage("hello world", "dc:123")).toBe(false);
+		expect(healer.handleMessage('{"type":"other"}', "dc:123")).toBe(false);
+
+		healer.destroy();
 	});
 });
