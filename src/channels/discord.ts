@@ -21,6 +21,7 @@ export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  onHealPayload?: (content: string, channelJid: string) => boolean;
 }
 
 export class DiscordChannel implements Channel {
@@ -129,6 +130,16 @@ export class DiscordChannel implements Channel {
         } catch {
           // Referenced message may have been deleted
         }
+      }
+
+      // Check for reactive heal payload before normal routing.
+      // Heal payloads are accepted from ANY channel, not just registered groups.
+      if (this.opts.onHealPayload?.(content, chatJid)) {
+        logger.info(
+          { chatJid, chatName, sender: senderName },
+          'Heal payload intercepted',
+        );
+        return;
       }
 
       // Store chat metadata for discovery

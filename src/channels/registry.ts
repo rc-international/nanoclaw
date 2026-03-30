@@ -9,6 +9,7 @@ export interface ChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  onHealPayload?: (content: string, channelJid: string) => boolean;
 }
 
 export type ChannelFactory = (opts: ChannelOpts) => Channel | null;

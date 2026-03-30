@@ -321,7 +321,7 @@ async function executeReactiveHeal(
     const group: RegisteredGroup = {
       name: `reactive-heal-${batch.user}-${batch.repo}`,
       folder: `reactive-heal-${batch.user}`,
-      trigger: /.*/,
+      trigger: '.*',
       added_at: new Date().toISOString(),
       containerConfig: {
         userProfileId: profile.id,
