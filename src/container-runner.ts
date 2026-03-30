@@ -164,15 +164,22 @@ function buildVolumeMounts(
   // Mount the user's Claude credentials file (read-only) into the per-group
   // .claude directory. The `claude` CLI authenticates directly via this file
   // using the user's Claude Max subscription — no proxy or token exchange needed.
-  const userHomeDir = group.containerConfig?.userProfileId
-    ? getUserProfile(group.containerConfig.userProfileId)?.homeDir
-    : undefined;
-  const credsSource = path.join(
-    userHomeDir || os.homedir(),
-    '.claude',
-    '.credentials.json',
-  );
-  if (fs.existsSync(credsSource)) {
+  const userProfileId = group.containerConfig?.userProfileId;
+  if (userProfileId) {
+    const profile = getUserProfile(userProfileId);
+    if (!profile) {
+      throw new Error(`Unknown user profile: ${userProfileId}`);
+    }
+    const credsSource = path.join(
+      profile.homeDir,
+      '.claude',
+      '.credentials.json',
+    );
+    if (!fs.existsSync(credsSource)) {
+      throw new Error(
+        `Claude credentials not found for profile ${userProfileId} at ${credsSource}`,
+      );
+    }
     mounts.push({
       hostPath: credsSource,
       containerPath: '/home/node/.claude/.credentials.json',

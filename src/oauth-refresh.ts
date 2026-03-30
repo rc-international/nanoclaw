@@ -205,9 +205,12 @@ async function doRefresh(
       return { refreshed: true };
     }
 
-    // CLI ran but token didn't change
-    logger.debug('CLI ran but token expiry unchanged');
-    return { refreshed: false };
+    // CLI ran but token didn't change — may indicate silent failure
+    logger.warn('CLI ran but token expiry unchanged — refresh may have failed');
+    return {
+      refreshed: false,
+      error: 'Token expiry unchanged after CLI refresh',
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ error: msg }, 'OAuth token refresh failed');

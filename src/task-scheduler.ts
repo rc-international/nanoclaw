@@ -239,18 +239,29 @@ async function runTask(
   };
 
   // Refresh OAuth token before spawning container to prevent 401 on stale tokens
-  const userHomeDir = group.containerConfig?.userProfileId
-    ? getUserProfile(group.containerConfig.userProfileId)?.homeDir
-    : undefined;
-  // Use a 1h buffer — always refresh before a task if token expires within 1h
-  const refreshResult = await ensureFreshToken(userHomeDir, 60 * 60 * 1000);
-  if (refreshResult.refreshed) {
-    logger.info({ taskId: task.id }, 'OAuth token refreshed before task');
-  } else if (refreshResult.error) {
-    logger.warn(
-      { taskId: task.id, error: refreshResult.error },
-      'OAuth token refresh failed before task, proceeding anyway',
-    );
+  const userProfileId = group.containerConfig?.userProfileId;
+  if (userProfileId) {
+    const profile = getUserProfile(userProfileId);
+    if (profile) {
+      // Use a 1h buffer — always refresh before a task if token expires within 1h
+      const refreshResult = await ensureFreshToken(
+        profile.homeDir,
+        60 * 60 * 1000,
+      );
+      if (refreshResult.refreshed) {
+        logger.info({ taskId: task.id }, 'OAuth token refreshed before task');
+      } else if (refreshResult.error) {
+        logger.warn(
+          { taskId: task.id, error: refreshResult.error },
+          'OAuth token refresh failed before task, proceeding anyway',
+        );
+      }
+    } else {
+      logger.warn(
+        { taskId: task.id, userProfileId },
+        'User profile not found, skipping OAuth token refresh',
+      );
+    }
   }
 
   try {
