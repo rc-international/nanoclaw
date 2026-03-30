@@ -56,6 +56,7 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import { ensureFreshToken } from './oauth-refresh.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -649,6 +650,19 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Keep OAuth token fresh in the background (every 2 hours).
+  // Tokens expire after ~8h; refreshing every 2h gives 3 retries before expiry.
+  // Buffer of 3h ensures we refresh well before the token expires, even if one
+  // check cycle is missed.
+  const REFRESH_INTERVAL_MS = 2 * 60 * 60 * 1000;
+  const REFRESH_BUFFER_MS = 3 * 60 * 60 * 1000;
+  setInterval(() => {
+    ensureFreshToken(undefined, REFRESH_BUFFER_MS).catch((err) =>
+      logger.warn({ err }, 'Background OAuth token refresh failed'),
+    );
+  }, REFRESH_INTERVAL_MS);
+
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);
