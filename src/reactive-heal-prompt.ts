@@ -1,7 +1,7 @@
-import type { HealBatch } from "./types.js";
+import type { HealBatch } from './types.js';
 
 function getTodayDate(): string {
-	return new Date().toISOString().split("T")[0];
+  return new Date().toISOString().split('T')[0];
 }
 
 /**
@@ -10,36 +10,36 @@ function getTodayDate(): string {
  * create fix branches + PRs, and report results via send_message.
  */
 export function buildReactiveHealPrompt(
-	batch: HealBatch,
-	repoContainerPath: string,
+  batch: HealBatch,
+  repoContainerPath: string,
 ): string {
-	const errorSections = batch.entries
-		.map((entry, i) => {
-			const lines = [
-				`ERROR ${i + 1} (${entry.occurrences} occurrence${entry.occurrences !== 1 ? "s" : ""}):`,
-				`  File: ${entry.file}:${entry.line}`,
-				`  Error: ${entry.error}`,
-			];
+  const errorSections = batch.entries
+    .map((entry, i) => {
+      const lines = [
+        `ERROR ${i + 1} (${entry.occurrences} occurrence${entry.occurrences !== 1 ? 's' : ''}):`,
+        `  File: ${entry.file}:${entry.line}`,
+        `  Error: ${entry.error}`,
+      ];
 
-			if (entry.traceback) {
-				lines.push(`  Traceback: ${entry.traceback}`);
-			}
+      if (entry.traceback) {
+        lines.push(`  Traceback: ${entry.traceback}`);
+      }
 
-			if (entry.blameCommit) {
-				let blameLine = `  Authored by commit: ${entry.blameCommit}`;
-				if (entry.sessionId) {
-					blameLine += ` (Session-Id: ${entry.sessionId})`;
-				}
-				lines.push(blameLine);
-			}
+      if (entry.blameCommit) {
+        let blameLine = `  Authored by commit: ${entry.blameCommit}`;
+        if (entry.sessionId) {
+          blameLine += ` (Session-Id: ${entry.sessionId})`;
+        }
+        lines.push(blameLine);
+      }
 
-			return lines.join("\n");
-		})
-		.join("\n\n");
+      return lines.join('\n');
+    })
+    .join('\n\n');
 
-	const today = getTodayDate();
+  const today = getTodayDate();
 
-	return `You are a code healer. These errors were reported in production:
+  return `You are a code healer. These errors were reported in production:
 
 ${errorSections}
 

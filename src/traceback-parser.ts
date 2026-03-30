@@ -1,6 +1,6 @@
 export interface TraceFrame {
-	file: string;
-	line: number;
+  file: string;
+  line: number;
 }
 
 // Python: File "path/to/file.py", line 42, in function_name
@@ -16,27 +16,27 @@ const NODE_FRAME = /at\s+(?:\S+\s+)?\(?((?:\/|[a-zA-Z]:)[^:)]+):(\d+):\d+\)?/g;
  * node: modules. Returns frames in source order.
  */
 export function parseTraceback(text: string): TraceFrame[] {
-	const frames: TraceFrame[] = [];
-	const seen = new Set<string>();
+  const frames: TraceFrame[] = [];
+  const seen = new Set<string>();
 
-	// Python frames
-	for (const match of text.matchAll(PYTHON_FRAME)) {
-		const key = `${match[1]}:${match[2]}`;
-		if (!seen.has(key)) {
-			seen.add(key);
-			frames.push({ file: match[1], line: parseInt(match[2], 10) });
-		}
-	}
+  // Python frames
+  for (const match of text.matchAll(PYTHON_FRAME)) {
+    const key = `${match[1]}:${match[2]}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      frames.push({ file: match[1], line: parseInt(match[2], 10) });
+    }
+  }
 
-	// Node.js frames (skip node: built-in modules)
-	for (const match of text.matchAll(NODE_FRAME)) {
-		if (match[1].startsWith("node:")) continue;
-		const key = `${match[1]}:${match[2]}`;
-		if (!seen.has(key)) {
-			seen.add(key);
-			frames.push({ file: match[1], line: parseInt(match[2], 10) });
-		}
-	}
+  // Node.js frames (skip node: built-in modules)
+  for (const match of text.matchAll(NODE_FRAME)) {
+    if (match[1].startsWith('node:')) continue;
+    const key = `${match[1]}:${match[2]}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      frames.push({ file: match[1], line: parseInt(match[2], 10) });
+    }
+  }
 
-	return frames;
+  return frames;
 }
