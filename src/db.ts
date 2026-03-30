@@ -693,6 +693,15 @@ export function getUserProfileByDiscordId(
   return row ? rowToUserProfile(row) : undefined;
 }
 
+export function getUserProfileByLinuxUsername(
+  linuxUsername: string,
+): UserProfile | undefined {
+  const row = db
+    .prepare('SELECT * FROM user_profiles WHERE linux_username = ?')
+    .get(linuxUsername) as UserProfileRow | undefined;
+  return row ? rowToUserProfile(row) : undefined;
+}
+
 export function setUserProfile(profile: UserProfile): void {
   db.prepare(
     `INSERT OR REPLACE INTO user_profiles (id, discord_user_id, linux_username, uid, gid, home_dir, repos, remote_sources, created_at)
