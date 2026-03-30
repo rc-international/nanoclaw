@@ -131,6 +131,61 @@ After each run, the user gets a Discord DM summary:
 | `container/skills/heal/SKILL.md` | Guides the container agent through the heal workflow |
 | `docs/plans/2026-03-24-code-healer-design.md` | Full design document |
 
+## Reactive Healing
+
+In addition to scheduled healing, NanoClaw responds to errors in real-time. When a structured error notification appears in a Discord channel, the reactive healer:
+
+1. Debounces errors (5-min window per user+repo, timer resets on each new error)
+2. Clones the repo on demand
+3. Traces errors to source via `git blame`
+4. Optionally resumes the Claude session that authored the code (via `Session-Id` commit trailer)
+5. Creates fix branches + PRs
+6. Posts results back to the originating Discord channel
+
+### Notification Contract
+
+Send a JSON payload to any Discord channel the bot can read:
+
+```json
+{
+  "nanoclaw": "heal",
+  "user": "bjern",
+  "repo": "datarake",
+  "repo_url": "https://github.com/bjern/datarake",
+  "error": "Client error '400 Bad Request' for url '...'",
+  "traceback": "File \"src/app.py\", line 305, in handler\n    resp.raise_for_status()",
+  "file": "src/app.py",
+  "line": 305,
+  "commit": "a1b2c3d",
+  "severity": "error"
+}
+```
+
+| Field | Required | Purpose |
+|-------|----------|---------|
+| `nanoclaw` | yes | Must be `"heal"` |
+| `user` | yes | Linux username — maps to user profile |
+| `repo` | yes | Repo name — for dedup and display |
+| `repo_url` | yes | Clone URL |
+| `error` | yes | Error message |
+| `traceback` | no | Stack trace (Python/Node.js) |
+| `file` | no | Source file — can be extracted from traceback |
+| `line` | no | Line number — can be extracted from traceback |
+| `commit` | no | Deployed commit SHA |
+| `severity` | no | `"error"` (default) or `"warning"` |
+
+### Session-Id Convention
+
+To enable session resumption, add a `Session-Id` trailer to commit messages:
+
+```
+fix: handle null response in parser
+
+Session-Id: c7e0c991-4c19-46c5-9def-ea609efb5c8e
+```
+
+The healer uses `git blame` to find the authoring commit, then extracts the `Session-Id` trailer to resume the original Claude session. Adoption is gradual — the healer works without it, just with less context.
+
 ## Requirements
 
 - Tailscale installed on all machines (VPS + remote log sources)

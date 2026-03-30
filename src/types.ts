@@ -138,3 +138,37 @@ export interface UserProfile {
   remoteSources: RemoteLogSource[];
   createdAt: string;
 }
+
+// --- Reactive Healer types ---
+
+export interface HealRequest {
+  nanoclaw: 'heal';
+  user: string; // Linux username
+  repo: string; // Repo name for dedup/display
+  repo_url: string; // Clone URL
+  error: string; // Error message
+  traceback?: string; // Stack trace
+  file?: string; // Source file path
+  line?: number; // Line number
+  commit?: string; // Deployed commit SHA
+  severity?: 'error' | 'warning';
+}
+
+export interface HealBatchEntry {
+  file: string;
+  line: number;
+  error: string;
+  traceback?: string;
+  commit?: string;
+  occurrences: number;
+  blameCommit?: string;
+  sessionId?: string;
+}
+
+export interface HealBatch {
+  user: string;
+  repo: string;
+  repo_url: string;
+  entries: HealBatchEntry[];
+  sourceChannelJid: string;
+}

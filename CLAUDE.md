@@ -20,6 +20,10 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `src/db.ts` | SQLite operations |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 | `container/skills/` | Skills loaded inside agent containers (browser, status, formatting) |
+| `src/reactive-healer.ts` | Reactive heal: interceptor, debouncer, validator, orchestrator |
+| `src/traceback-parser.ts` | Extract file+line from Python/Node.js traces |
+| `src/repo-cloner.ts` | Clone repos, git blame, Session-Id extraction |
+| `src/reactive-heal-prompt.ts` | Error-driven heal prompt builder |
 
 ## Skills
 

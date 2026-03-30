@@ -56,6 +56,7 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
+import { createReactiveHealer } from './reactive-healer.js';
 import { ensureFreshToken } from './oauth-refresh.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
@@ -536,6 +537,21 @@ async function main(): Promise<void> {
     }
   }
 
+  // Reactive healer — intercepts heal payloads from Discord before normal routing
+  const reactiveHealer = createReactiveHealer({
+    queue,
+    sendMessage: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      if (channel) {
+        await channel.sendMessage(jid, text);
+      } else {
+        logger.warn({ jid }, 'No channel owns JID for reactive heal response');
+      }
+    },
+    onProcess: (groupJid, proc, containerName, groupFolder) =>
+      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+  });
+
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
@@ -574,6 +590,8 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onHealPayload: (content: string, channelJid: string) =>
+      reactiveHealer.handleMessage(content, channelJid),
   };
 
   // Create and connect all registered channels.
