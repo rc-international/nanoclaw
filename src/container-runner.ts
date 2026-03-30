@@ -167,7 +167,11 @@ function buildVolumeMounts(
   const userHomeDir = group.containerConfig?.userProfileId
     ? getUserProfile(group.containerConfig.userProfileId)?.homeDir
     : undefined;
-  const credsSource = path.join(userHomeDir || os.homedir(), '.claude', '.credentials.json');
+  const credsSource = path.join(
+    userHomeDir || os.homedir(),
+    '.claude',
+    '.credentials.json',
+  );
   if (fs.existsSync(credsSource)) {
     mounts.push({
       hostPath: credsSource,

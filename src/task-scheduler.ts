@@ -22,6 +22,7 @@ import type { GroupQueue } from './group-queue.js';
 import { buildHealPrompt } from './heal-prompt.js';
 import { cleanupSyncedLogs, syncAllRemoteLogs } from './log-sync.js';
 import { logger } from './logger.js';
+import { ensureFreshToken } from './oauth-refresh.js';
 import type { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -236,6 +237,21 @@ async function runTask(
       deps.queue.closeStdin(task.chat_jid);
     }, TASK_CLOSE_DELAY_MS);
   };
+
+  // Refresh OAuth token before spawning container to prevent 401 on stale tokens
+  const userHomeDir = group.containerConfig?.userProfileId
+    ? getUserProfile(group.containerConfig.userProfileId)?.homeDir
+    : undefined;
+  // Use a 1h buffer — always refresh before a task if token expires within 1h
+  const refreshResult = await ensureFreshToken(userHomeDir, 60 * 60 * 1000);
+  if (refreshResult.refreshed) {
+    logger.info({ taskId: task.id }, 'OAuth token refreshed before task');
+  } else if (refreshResult.error) {
+    logger.warn(
+      { taskId: task.id, error: refreshResult.error },
+      'OAuth token refresh failed before task, proceeding anyway',
+    );
+  }
 
   try {
     const output = await runContainerAgent(

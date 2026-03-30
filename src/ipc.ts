@@ -405,6 +405,8 @@ export async function processTaskIpc(
             if (!isNaN(ms) && ms > 0) {
               updates.next_run = new Date(Date.now() + ms).toISOString();
             }
+          } else if (updatedTask.schedule_type === 'once') {
+            updates.next_run = updatedTask.schedule_value;
           }
         }
 
