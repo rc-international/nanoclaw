@@ -16,7 +16,7 @@ import {
   getRegisteredChannelNames,
 } from './channels/registry.js';
 import {
-  ContainerOutput,
+  type ContainerOutput,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -41,29 +41,91 @@ import {
   storeChatMetadata,
   storeMessage,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { logger } from './logger.js';
+import { ensureFreshToken } from './oauth-refresh.js';
+import { createReactiveHealer } from './reactive-healer.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
   stopRemoteControl,
 } from './remote-control.js';
+import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   isSenderAllowed,
   isTriggerAllowed,
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
-import { createReactiveHealer } from './reactive-healer.js';
-import { ensureFreshToken } from './oauth-refresh.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
-import { logger } from './logger.js';
+import type { Channel, NewMessage, RegisteredGroup } from './types.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+/**
+ * Regex to detect any @mention in a message (used to warn when someone
+ * addresses the bot by the wrong name).
+ */
+const AT_MENTION_PATTERN = /^@\w+\b/i;
+
+export interface TriggerCheckResult {
+  shouldProcess: boolean;
+  reason?: string;
+}
+
+/**
+ * Check whether a batch of messages contains a valid trigger.
+ * Exported for testing — used by both processGroupMessages and startMessageLoop.
+ */
+export function checkTrigger(
+  messages: NewMessage[],
+  chatJid: string,
+  groupName: string,
+  triggerPattern: RegExp,
+  allowlistCfg: ReturnType<typeof loadSenderAllowlist>,
+): TriggerCheckResult {
+  const hasTrigger = messages.some(
+    (m) =>
+      triggerPattern.test(m.content.trim()) &&
+      (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+  );
+
+  if (hasTrigger) return { shouldProcess: true };
+
+  // Check if any message has an @mention that doesn't match — likely wrong bot name
+  const misdirectedMsg = messages.find(
+    (m) =>
+      AT_MENTION_PATTERN.test(m.content.trim()) &&
+      !triggerPattern.test(m.content.trim()),
+  );
+
+  if (misdirectedMsg) {
+    const attempted = misdirectedMsg.content.trim().match(AT_MENTION_PATTERN);
+    logger.warn(
+      {
+        chatJid,
+        group: groupName,
+        sender: misdirectedMsg.sender,
+        attempted: attempted?.[0],
+        expected: triggerPattern.source,
+      },
+      `Message addressed to "${attempted?.[0]}" but trigger is "${triggerPattern.source}" — not processing`,
+    );
+    return {
+      shouldProcess: false,
+      reason: `wrong_mention:${attempted?.[0]}`,
+    };
+  }
+
+  logger.debug(
+    { chatJid, group: groupName, messageCount: messages.length },
+    'No trigger found in messages, skipping',
+  );
+  return { shouldProcess: false, reason: 'no_trigger' };
+}
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
@@ -173,12 +235,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+    const result = checkTrigger(
+      missedMessages,
+      chatJid,
+      group.name,
+      TRIGGER_PATTERN,
+      allowlistCfg,
     );
-    if (!hasTrigger) return true;
+    if (!result.shouldProcess) return true;
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
@@ -401,13 +465,14 @@ async function startMessageLoop(): Promise<void> {
           // context when a trigger eventually arrives.
           if (needsTrigger) {
             const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+            const result = checkTrigger(
+              groupMessages,
+              chatJid,
+              group.name,
+              TRIGGER_PATTERN,
+              allowlistCfg,
             );
-            if (!hasTrigger) continue;
+            if (!result.shouldProcess) continue;
           }
 
           // Pull all messages since lastAgentTimestamp so non-trigger
